@@ -65,6 +65,8 @@ def parse_args():
     p.add_argument("--fps", type=float, default=2.0)
     p.add_argument("--threshold", type=float, default=1e-3,
                    help="Max-abs-diff threshold to flag a layer as 'diverged'.")
+    p.add_argument("--max_decode_steps", type=int, default=20,
+                   help="How many decode steps to compare layer-by-layer.")
     p.add_argument("--system_prompt", default=DEFAULT_SYSTEM_PROMPT)
     return p.parse_args()
 
@@ -154,16 +156,18 @@ def build_inputs(processor, history, device):
     return inputs
 
 
+def eos_ids(processor):
+    e = processor.tokenizer.eos_token_id
+    return set(e) if isinstance(e, list) else {e}
+
+
 @torch.no_grad()
-def full_forward_one_token(base_model, inputs):
+def full_forward_multi_step(base_model, inputs, max_steps):
     """
-    Run a fresh prefill+1-decode through model.generate() and capture every
-    layer's hidden state for the decoded position. This is the *real* path
-    that HF generate() uses, including its prepare_inputs_for_generation
-    handling of cache_position / position_ids / rope_deltas.
+    Run prefill + N decode steps via model.generate() and return per-step
+    hidden_states. Returns: list of length N, each entry is a tuple of
+    (num_layers + 1) tensors (embed-or-pre-layer + ... + final_norm).
     """
-    # Build generate() kwargs from raw inputs only (don't reuse the forward()
-    # kwargs dict, which has overlapping flags like use_cache / drop_*).
     multimodal_keys = ("input_ids", "attention_mask",
                        "pixel_values", "pixel_values_videos",
                        "image_grid_thw", "video_grid_thw",
@@ -171,7 +175,7 @@ def full_forward_one_token(base_model, inputs):
     kwargs = {k: inputs[k] for k in multimodal_keys if inputs.get(k) is not None}
     out = base_model.generate(
         **kwargs,
-        max_new_tokens=2,                # 1 prefill + 1 decode step
+        max_new_tokens=max_steps + 1,    # 1 prefill + N decode steps
         do_sample=False,
         use_cache=True,
         return_dict_in_generate=True,
@@ -180,43 +184,35 @@ def full_forward_one_token(base_model, inputs):
         drop_threshold=1.0,
         drop_absolute=True,
     )
-    # out.hidden_states is a tuple of length max_new_tokens.
-    # element 0  = prefill (tuple of layer outputs over the whole prompt)
-    # element 1  = first decode step (tuple of layer outputs over 1 new token)
-    decode_hs = out.hidden_states[1]          # tuple of (num_layers + 1) tensors
-    new_ids = out.sequences[0, inputs['input_ids'].shape[1]:]
-    return decode_hs, new_ids
+    # out.hidden_states[0] = prefill, [1..N] = decode steps 1..N
+    per_step = list(out.hidden_states[1:])
+    new_ids = out.sequences[0, inputs['input_ids'].shape[1]:].tolist()
+    return per_step, new_ids
 
 
 @torch.no_grad()
-def manual_forward_one_token(kang, next_tok, exit_layer):
+def manual_decode_one_step(kang, next_tok, exit_layer):
     """
-    Run a single decode step through forward_draft_or_large_model. We capture
-    every layer's hidden state by manually re-implementing the loop here.
+    One manual_ar decode step. Returns (captured_layers, normed_logits).
+    captured_layers = embed + N raw layer outputs + final_norm.
     """
     base = kang.base_model
     qwen = base.model.model
-
-    # --- draft phase (layers 0 .. exit_layer-1) ---
     captured = []
+
     bsz, seq_len = next_tok.shape
     hidden = qwen.embed_tokens(next_tok)
-    captured.append(hidden.detach().clone())  # embedding output
+    captured.append(hidden.detach().clone())
 
     layer_past_length = base._get_layer_cache_length(0)
     base.past_key_values._seen_tokens = layer_past_length
-
     cache_position = torch.arange(layer_past_length, layer_past_length + seq_len, device=hidden.device)
 
     rope_deltas = base.model.rope_deltas
-    if rope_deltas is not None:
-        delta = (layer_past_length + rope_deltas).to(hidden.device)
-    else:
-        delta = layer_past_length
+    delta = (layer_past_length + rope_deltas).to(hidden.device) if rope_deltas is not None else layer_past_length
     pos_ids = torch.arange(seq_len, device=hidden.device).view(1, -1).expand(bsz, -1) + delta
     pos_ids = pos_ids.unsqueeze(0).expand(3, -1, -1)
     pos_emb = qwen.rotary_emb(hidden, pos_ids)
-
     attn_mask = torch.ones((bsz, layer_past_length + seq_len), dtype=torch.bool, device=hidden.device)
     causal_mask = qwen._update_causal_mask(attn_mask, hidden, cache_position,
                                            base.past_key_values, output_attentions=False)
@@ -229,21 +225,13 @@ def manual_forward_one_token(kang, next_tok, exit_layer):
         hidden = out[0]
         captured.append(hidden.detach().clone())
 
-    # --- verify phase (layers exit_layer .. end) ---
     layer_past_length_v = base._get_layer_cache_length(exit_layer)
     base.past_key_values._seen_tokens = layer_past_length_v
-
     cache_position_v = torch.arange(layer_past_length_v, layer_past_length_v + seq_len, device=hidden.device)
-
-    rope_deltas = base.model.rope_deltas
-    if rope_deltas is not None:
-        delta_v = (layer_past_length_v + rope_deltas).to(hidden.device)
-    else:
-        delta_v = layer_past_length_v
+    delta_v = (layer_past_length_v + rope_deltas).to(hidden.device) if rope_deltas is not None else layer_past_length_v
     pos_ids_v = torch.arange(seq_len, device=hidden.device).view(1, -1).expand(bsz, -1) + delta_v
     pos_ids_v = pos_ids_v.unsqueeze(0).expand(3, -1, -1)
     pos_emb_v = qwen.rotary_emb(hidden, pos_ids_v)
-
     attn_mask_v = torch.ones((bsz, layer_past_length_v + seq_len), dtype=torch.bool, device=hidden.device)
     causal_mask_v = qwen._update_causal_mask(attn_mask_v, hidden, cache_position_v,
                                              base.past_key_values, output_attentions=False)
@@ -257,9 +245,9 @@ def manual_forward_one_token(kang, next_tok, exit_layer):
         captured.append(hidden.detach().clone())
 
     hidden_normed = qwen.norm(hidden)
-    captured.append(hidden_normed.detach().clone())  # final norm output
+    captured.append(hidden_normed.detach().clone())
     logits = kang.head_model(hidden_normed)
-    return captured, logits, (pos_ids, pos_ids_v, layer_past_length, layer_past_length_v)
+    return captured, logits
 
 
 def main():
@@ -328,107 +316,84 @@ def main():
           f"({processor.tokenizer.decode([first_tok_b])!r})")
     del out_pre_a
 
-    # path A: re-run via generate() to capture decode hidden_states the way HF does it
+    # path A: re-run via generate() with multi-step to capture every decode step
     if hasattr(base, 'reset_status'):
         base.reset_status()
-    hs_a, new_ids_a = full_forward_one_token(base, inputs)
-    first_tok_a = new_ids_a[0].item()
-    print(f"  first_tok via generate() prefill    : {first_tok_a} "
-          f"({processor.tokenizer.decode([first_tok_a])!r})")
+    hs_a_per_step, new_ids_a = full_forward_multi_step(base, inputs, args.max_decode_steps)
+    print(f"  generate produced {len(new_ids_a)} new tokens")
 
-    # --- one decode step on both paths ---
-    print("\n--- decode step 1 ---")
-    next_tok = torch.tensor([[first_tok_a]], device=args.device)
+    # --- multi-step decode on path B, comparing to path A's per-step hidden_states ---
+    print(f"\n--- multi-step decode comparison (up to {args.max_decode_steps} steps) ---")
 
-    hs_b, logits_b, dbg = manual_forward_one_token(kang, next_tok, args.exit_layer)
-
-    # MMDuet2 modeling stores hidden_states as:
-    #   hs_a[0]      = embedding
-    #   hs_a[1..N-1] = "before layer i" = output of layer i-1   (for i in 1..N-1)
-    #   hs_a[N]      = AFTER final norm
-    # So hs_a has N+1 entries when there are N layers.  Layer (N-1) raw output
-    # is NOT directly in hs_a -- only its post-norm form is.
-    #
-    # Manual captured (hs_b):
-    #   hs_b[0]      = embedding
-    #   hs_b[1..N]   = output of layer 0..N-1 (raw, before norm)
-    #   hs_b[N+1]   = AFTER final norm
-    # So hs_b has N+2 entries.
     n_layers = len(kang.base_model.model.model.layers)
-    assert len(hs_a) == n_layers + 1, \
-        f"hs_a has {len(hs_a)} entries, expected {n_layers + 1}"
-    assert len(hs_b) == n_layers + 2, \
-        f"hs_b has {len(hs_b)} entries, expected {n_layers + 2}"
 
-    print(f"  full(generate)  returned {len(hs_a)} hidden_states "
-          f"(embed + {n_layers - 1} pre-layer states + final_norm)")
-    print(f"  manual          returned {len(hs_b)} hidden_states "
-          f"(embed + {n_layers} layer outputs + final_norm)")
+    # The same first decode step uses the same input_token: argmax of prefill logits.
+    # Both generate() and our manual loop start from this token, so we feed the
+    # token chosen by generate() at each step into the manual decoder. If a step
+    # produces a different token on path B than on path A, the manual loop has
+    # *already* diverged at that step; we still keep stepping with path A's token
+    # to keep both paths synchronized for hidden-state comparison.
 
-    print(f"\n{'a_idx':>5}  {'b_idx':>5}  {'name':<22}  {'max_abs_diff':>14}  {'mean_abs_diff':>14}  {'flag':>6}")
-    print("-" * 80)
+    print(f"  {'step':>4}  {'first_div':>10}  {'name':<20}  "
+          f"{'max_d':>10}  {'a_tok':>22}  {'b_tok':>22}  {'match':>6}")
+    print("-" * 100)
 
-    first_diverge_name = None
+    next_tok_id = first_tok_b   # equal to first_tok_a (we asserted via prefill above)
+    first_step_div = -1
 
-    def _cmp(a_idx, b_idx, name):
-        nonlocal first_diverge_name
-        a = hs_a[a_idx].float()
-        b = hs_b[b_idx].float()
-        if a.shape != b.shape:
-            print(f"  shape mismatch [{name}]: {a.shape} vs {b.shape}")
-            return
-        diff = (a - b).abs()
-        max_d, mean_d = diff.max().item(), diff.mean().item()
-        flag = "**" if max_d > args.threshold else ""
-        if first_diverge_name is None and max_d > args.threshold:
-            first_diverge_name = name
-        print(f"  {a_idx:>5}  {b_idx:>5}  {name:<22}  {max_d:>14.3e}  {mean_d:>14.3e}  {flag:>6}")
+    for step in range(min(args.max_decode_steps, len(hs_a_per_step))):
+        next_tok = torch.tensor([[next_tok_id]], device=args.device)
+        hs_b, logits_b = manual_decode_one_step(kang, next_tok, args.exit_layer)
+        hs_a = hs_a_per_step[step]
+        assert len(hs_a) == n_layers + 1
+        assert len(hs_b) == n_layers + 2
 
-    # apples-to-apples comparison
-    _cmp(0, 0, "embedding")
-    # hs_a[i] for i in 1..n_layers-1 == "input to layer i" == "output of layer i-1"
-    # hs_b[i] for i in 1..n_layers   == "output of layer i-1"
-    for i in range(1, n_layers):
-        _cmp(i, i, f"layer{i-1} out")
-    # last layer's raw output is only stored in hs_b
-    print(f"  {'-':>5}  {n_layers:>5}  {'layer' + str(n_layers-1) + ' out (manual only)':<22}"
-          f"  {'(no a)':>14}  {'':>14}")
-    # final norm output is at hs_a[n_layers] and hs_b[n_layers+1]
-    _cmp(n_layers, n_layers + 1, "final_norm")
+        # Find first layer where this step's hidden_states diverge.
+        first_layer_name = None
+        first_max_d = 0.0
+        # idx 0..n_layers-1: hs_a[i] vs hs_b[i] (embed / output of layer i-1)
+        for i in range(n_layers):
+            d = (hs_a[i].float() - hs_b[i].float()).abs().max().item()
+            if d > args.threshold:
+                first_layer_name = "embedding" if i == 0 else f"layer{i-1}"
+                first_max_d = d
+                break
+        # final norm: hs_a[n_layers] vs hs_b[n_layers + 1]
+        if first_layer_name is None:
+            d = (hs_a[n_layers].float() - hs_b[n_layers + 1].float()).abs().max().item()
+            if d > args.threshold:
+                first_layer_name = "final_norm"
+                first_max_d = d
 
-    # logits comparison (use bf16 lm_head dtype)
-    head = kang.head_model  # same weights as base.lm_head, shared tensor
-    logits_a = head(hs_a[n_layers])     # apply lm_head to final_norm
-    logits_b = head(hs_b[n_layers + 1])
-    diff_logits = (logits_a.float() - logits_b.float()).abs()
-    top1_a = logits_a[:, -1, :].argmax(-1).item()
-    top1_b = logits_b[:, -1, :].argmax(-1).item()
-    print(f"\n  logits max diff: {diff_logits.max().item():.3e}")
-    print(f"  top1 full  : {top1_a} ({processor.tokenizer.decode([top1_a])!r})")
-    print(f"  top1 manual: {top1_b} ({processor.tokenizer.decode([top1_b])!r})")
+        a_tok = new_ids_a[step]
+        b_tok = logits_b[:, -1, :].argmax(-1).item()
+        match = "OK" if a_tok == b_tok else "**"
+
+        if first_step_div < 0 and (first_layer_name is not None or a_tok != b_tok):
+            first_step_div = step
+
+        a_str = f"{a_tok}({processor.tokenizer.decode([a_tok])!r})"[:22]
+        b_str = f"{b_tok}({processor.tokenizer.decode([b_tok])!r})"[:22]
+        layer_str = first_layer_name or "(all bit-exact)"
+        print(f"  {step:>4}  {first_step_div if first_step_div == step else '':>10}  "
+              f"{layer_str:<20}  {first_max_d:>10.3e}  {a_str:>22}  {b_str:>22}  {match:>6}")
+
+        # use path A's token to keep stepping (so both caches stay synchronized)
+        next_tok_id = a_tok
+        if a_tok in eos_ids(processor):
+            print(f"  [hit EOS at step {step}]")
+            break
 
     print("\n========== DIAGNOSIS ==========")
-    if first_diverge_name is None:
-        print(f"All compared tensors within threshold {args.threshold:.0e}.")
-        print("Step-1 decode is bit-equivalent. The 3/30 greedy divergences seen in")
-        print("verify_generate_vs_manual_ar.py must come from cumulative drift over many")
-        print("decode steps, not from a structural path difference at a single step.")
-        print("Recommendation: run more decode steps in this diagnostic to pinpoint")
-        print("the step at which drift first crosses the threshold.")
-    elif first_diverge_name == "embedding":
-        print("Diverges at EMBEDDING output -> input_ids differ between paths.")
-    elif first_diverge_name == "final_norm":
-        print("Diverges only at the FINAL norm output. All decoder layers match.")
-        print("Root cause: post-norm numerics (likely RMSNorm dtype handling).")
+    if first_step_div < 0:
+        print(f"Both paths bit-equivalent for all {args.max_decode_steps} decode steps.")
+        print("Either the verify divergence happens beyond this many steps, or it is")
+        print("specific to the FA2 attention kernel choosing a different reduction.")
     else:
-        print(f"First diverges at {first_diverge_name}.")
-        if first_diverge_name == f"layer{args.exit_layer-1} out":
-            print("This is the layer right before the draft/verify boundary.")
-        elif first_diverge_name == f"layer{args.exit_layer} out":
-            print("This is the FIRST layer of the verify half -- look at "
-                  "forward_draft_or_large_model's hand-off (rope_deltas, _seen_tokens).")
-        else:
-            print("That layer's attention sees a different KV cache state between paths.")
+        print(f"First step that diverges: step {first_step_div}.")
+        print("Layer / value diff at that step is shown above. If 'name' is")
+        print("(all bit-exact) but tokens differ, divergence is purely in the lm_head")
+        print("argmax (sub-threshold drift right at the top-1/top-2 boundary).")
 
 
 if __name__ == "__main__":
