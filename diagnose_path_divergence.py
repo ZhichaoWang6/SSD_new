@@ -163,8 +163,9 @@ def full_forward_one_token(base_model, processor, prefill_inputs):
     handling of cache_position / position_ids / rope_deltas.
     """
     # generate() owns these flags itself; strip them so we don't pass them twice.
-    gen_inputs = {k: v for k, v in prefill_inputs.items()
-                  if k not in {"use_cache", "output_hidden_states", "return_dict"}}
+    _strip = {"use_cache", "output_hidden_states", "return_dict",
+              "drop_method", "drop_threshold", "drop_absolute"}
+    gen_inputs = {k: v for k, v in prefill_inputs.items() if k not in _strip}
     out = base_model.generate(
         **gen_inputs,
         max_new_tokens=2,                # 1 prefill + 1 decode step
