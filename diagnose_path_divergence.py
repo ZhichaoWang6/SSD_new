@@ -342,41 +342,65 @@ def main():
 
     hs_b, logits_b, dbg = manual_forward_one_token(kang, next_tok, args.exit_layer)
 
-    print(f"  full forward returned {len(hs_a)} hidden_states (embed + {len(hs_a)-1} layers)")
-    print(f"  manual returned {len(hs_b)} hidden_states (embed + {len(hs_b)-2} layers + final_norm)")
+    # MMDuet2 modeling stores hidden_states as:
+    #   hs_a[0]      = embedding
+    #   hs_a[1..N-1] = "before layer i" = output of layer i-1   (for i in 1..N-1)
+    #   hs_a[N]      = AFTER final norm
+    # So hs_a has N+1 entries when there are N layers.  Layer (N-1) raw output
+    # is NOT directly in hs_a -- only its post-norm form is.
+    #
+    # Manual captured (hs_b):
+    #   hs_b[0]      = embedding
+    #   hs_b[1..N]   = output of layer 0..N-1 (raw, before norm)
+    #   hs_b[N+1]   = AFTER final norm
+    # So hs_b has N+2 entries.
+    n_layers = len(kang.base_model.model.model.layers)
+    assert len(hs_a) == n_layers + 1, \
+        f"hs_a has {len(hs_a)} entries, expected {n_layers + 1}"
+    assert len(hs_b) == n_layers + 2, \
+        f"hs_b has {len(hs_b)} entries, expected {n_layers + 2}"
 
-    # hs_a[0] = embedding, hs_a[1..N] = layer 0..N-1 outputs
-    # hs_b[0] = embedding, hs_b[1..N] = layer 0..N-1 outputs, hs_b[N+1] = norm
-    n_layers = len(hs_a) - 1
-    assert n_layers == len(kang.base_model.model.model.layers)
+    print(f"  full(generate)  returned {len(hs_a)} hidden_states "
+          f"(embed + {n_layers - 1} pre-layer states + final_norm)")
+    print(f"  manual          returned {len(hs_b)} hidden_states "
+          f"(embed + {n_layers} layer outputs + final_norm)")
 
-    print(f"\n{'idx':>4}  {'name':<14}  {'max_abs_diff':>14}  {'mean_abs_diff':>14}  {'flag':>6}")
-    print("-" * 64)
-    first_diverge = -1
-    for i in range(n_layers + 1):
-        a = hs_a[i].float()
-        b = hs_b[i].float()
+    print(f"\n{'a_idx':>5}  {'b_idx':>5}  {'name':<22}  {'max_abs_diff':>14}  {'mean_abs_diff':>14}  {'flag':>6}")
+    print("-" * 80)
+
+    first_diverge_name = None
+
+    def _cmp(a_idx, b_idx, name):
+        nonlocal first_diverge_name
+        a = hs_a[a_idx].float()
+        b = hs_b[b_idx].float()
         if a.shape != b.shape:
-            print(f"  shape mismatch at idx {i}: {a.shape} vs {b.shape}")
-            continue
+            print(f"  shape mismatch [{name}]: {a.shape} vs {b.shape}")
+            return
         diff = (a - b).abs()
         max_d, mean_d = diff.max().item(), diff.mean().item()
         flag = "**" if max_d > args.threshold else ""
-        if first_diverge < 0 and max_d > args.threshold:
-            first_diverge = i
-        name = "embedding" if i == 0 else f"layer{i-1}"
-        print(f"  {i:>4}  {name:<14}  {max_d:>14.3e}  {mean_d:>14.3e}  {flag:>6}")
+        if first_diverge_name is None and max_d > args.threshold:
+            first_diverge_name = name
+        print(f"  {a_idx:>5}  {b_idx:>5}  {name:<22}  {max_d:>14.3e}  {mean_d:>14.3e}  {flag:>6}")
 
-    # final norm comparison: compute norm(hs_a[-1]) and compare to hs_b[-1]
-    a_final = base.model.norm(hs_a[-1]).float()
-    b_final = hs_b[-1].float()
-    diff_norm = (a_final - b_final).abs()
-    print(f"  {'norm':>4}  {'final_norm':<14}  {diff_norm.max().item():>14.3e}  "
-          f"{diff_norm.mean().item():>14.3e}")
+    # apples-to-apples comparison
+    _cmp(0, 0, "embedding")
+    # hs_a[i] for i in 1..n_layers-1 == "input to layer i" == "output of layer i-1"
+    # hs_b[i] for i in 1..n_layers   == "output of layer i-1"
+    for i in range(1, n_layers):
+        _cmp(i, i, f"layer{i-1} out")
+    # last layer's raw output is only stored in hs_b
+    print(f"  {'-':>5}  {n_layers:>5}  {'layer' + str(n_layers-1) + ' out (manual only)':<22}"
+          f"  {'(no a)':>14}  {'':>14}")
+    # final norm output is at hs_a[n_layers] and hs_b[n_layers+1]
+    _cmp(n_layers, n_layers + 1, "final_norm")
 
-    # logits via lm_head on each path's final-norm output
-    logits_a = base.lm_head(a_final)
-    diff_logits = (logits_a - logits_b.float()).abs()
+    # logits comparison (use bf16 lm_head dtype)
+    head = kang.head_model  # same weights as base.lm_head, shared tensor
+    logits_a = head(hs_a[n_layers])     # apply lm_head to final_norm
+    logits_b = head(hs_b[n_layers + 1])
+    diff_logits = (logits_a.float() - logits_b.float()).abs()
     top1_a = logits_a[:, -1, :].argmax(-1).item()
     top1_b = logits_b[:, -1, :].argmax(-1).item()
     print(f"\n  logits max diff: {diff_logits.max().item():.3e}")
@@ -384,19 +408,27 @@ def main():
     print(f"  top1 manual: {top1_b} ({processor.tokenizer.decode([top1_b])!r})")
 
     print("\n========== DIAGNOSIS ==========")
-    if first_diverge < 0:
-        print(f"All layers within threshold {args.threshold:.0e}.")
-        print("Divergence at greedy level is from sub-threshold drift (cumulative).")
-    elif first_diverge == 0:
-        print("Diverges at EMBEDDING output -> input_ids or position embeddings differ.")
-    elif first_diverge == args.exit_layer:
-        print(f"Diverges exactly at layer {args.exit_layer} (= exit_layer).")
-        print("Likely root cause: draft -> verify hand-off in forward_draft_or_large_model.")
-        print("Check _seen_tokens override and rope_deltas re-use between the two halves.")
+    if first_diverge_name is None:
+        print(f"All compared tensors within threshold {args.threshold:.0e}.")
+        print("Step-1 decode is bit-equivalent. The 3/30 greedy divergences seen in")
+        print("verify_generate_vs_manual_ar.py must come from cumulative drift over many")
+        print("decode steps, not from a structural path difference at a single step.")
+        print("Recommendation: run more decode steps in this diagnostic to pinpoint")
+        print("the step at which drift first crosses the threshold.")
+    elif first_diverge_name == "embedding":
+        print("Diverges at EMBEDDING output -> input_ids differ between paths.")
+    elif first_diverge_name == "final_norm":
+        print("Diverges only at the FINAL norm output. All decoder layers match.")
+        print("Root cause: post-norm numerics (likely RMSNorm dtype handling).")
     else:
-        print(f"First diverges at layer {first_diverge}.")
-        print("Likely root cause: that layer's attention sees a different KV cache state")
-        print("between the two paths (e.g. cache_position / sliding window).")
+        print(f"First diverges at {first_diverge_name}.")
+        if first_diverge_name == f"layer{args.exit_layer-1} out":
+            print("This is the layer right before the draft/verify boundary.")
+        elif first_diverge_name == f"layer{args.exit_layer} out":
+            print("This is the FIRST layer of the verify half -- look at "
+                  "forward_draft_or_large_model's hand-off (rope_deltas, _seen_tokens).")
+        else:
+            print("That layer's attention sees a different KV cache state between paths.")
 
 
 if __name__ == "__main__":
