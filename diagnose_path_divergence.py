@@ -155,19 +155,22 @@ def build_inputs(processor, history, device):
 
 
 @torch.no_grad()
-def full_forward_one_token(base_model, processor, prefill_inputs):
+def full_forward_one_token(base_model, inputs):
     """
     Run a fresh prefill+1-decode through model.generate() and capture every
     layer's hidden state for the decoded position. This is the *real* path
     that HF generate() uses, including its prepare_inputs_for_generation
     handling of cache_position / position_ids / rope_deltas.
     """
-    # generate() owns these flags itself; strip them so we don't pass them twice.
-    _strip = {"use_cache", "output_hidden_states", "return_dict",
-              "drop_method", "drop_threshold", "drop_absolute"}
-    gen_inputs = {k: v for k, v in prefill_inputs.items() if k not in _strip}
+    # Build generate() kwargs from raw inputs only (don't reuse the forward()
+    # kwargs dict, which has overlapping flags like use_cache / drop_*).
+    multimodal_keys = ("input_ids", "attention_mask",
+                       "pixel_values", "pixel_values_videos",
+                       "image_grid_thw", "video_grid_thw",
+                       "second_per_grid_ts")
+    kwargs = {k: inputs[k] for k in multimodal_keys if inputs.get(k) is not None}
     out = base_model.generate(
-        **gen_inputs,
+        **kwargs,
         max_new_tokens=2,                # 1 prefill + 1 decode step
         do_sample=False,
         use_cache=True,
@@ -181,8 +184,7 @@ def full_forward_one_token(base_model, processor, prefill_inputs):
     # element 0  = prefill (tuple of layer outputs over the whole prompt)
     # element 1  = first decode step (tuple of layer outputs over 1 new token)
     decode_hs = out.hidden_states[1]          # tuple of (num_layers + 1) tensors
-    # also return the decoded token id for sanity check
-    new_ids = out.sequences[0, prefill_inputs['input_ids'].shape[1]:]
+    new_ids = out.sequences[0, inputs['input_ids'].shape[1]:]
     return decode_hs, new_ids
 
 
@@ -329,7 +331,7 @@ def main():
     # path A: re-run via generate() to capture decode hidden_states the way HF does it
     if hasattr(base, 'reset_status'):
         base.reset_status()
-    hs_a, new_ids_a = full_forward_one_token(base, processor, prefill_kwargs)
+    hs_a, new_ids_a = full_forward_one_token(base, inputs)
     first_tok_a = new_ids_a[0].item()
     print(f"  first_tok via generate() prefill    : {first_tok_a} "
           f"({processor.tokenizer.decode([first_tok_a])!r})")
