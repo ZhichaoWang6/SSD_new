@@ -155,25 +155,31 @@ def build_inputs(processor, history, device):
 
 
 @torch.no_grad()
-def full_forward_one_token(base_model, next_tok, past_key_values):
+def full_forward_one_token(base_model, processor, prefill_inputs):
     """
-    Run a single decode step through the full model.forward() and capture every
-    layer's hidden state.
+    Run a fresh prefill+1-decode through model.generate() and capture every
+    layer's hidden state for the decoded position. This is the *real* path
+    that HF generate() uses, including its prepare_inputs_for_generation
+    handling of cache_position / position_ids / rope_deltas.
     """
-    out = base_model(
-        input_ids=next_tok,
-        past_key_values=past_key_values,
+    out = base_model.generate(
+        **prefill_inputs,
+        max_new_tokens=2,                # 1 prefill + 1 decode step
+        do_sample=False,
         use_cache=True,
+        return_dict_in_generate=True,
         output_hidden_states=True,
-        return_dict=True,
         drop_method="none",
         drop_threshold=1.0,
         drop_absolute=True,
     )
-    # out.hidden_states is a tuple of (num_layers + 1) tensors:
-    #   index 0 = embedding output (input to layer 0)
-    #   index l (1..N) = output of layer l-1
-    return out.hidden_states, out.past_key_values, out.logits
+    # out.hidden_states is a tuple of length max_new_tokens.
+    # element 0  = prefill (tuple of layer outputs over the whole prompt)
+    # element 1  = first decode step (tuple of layer outputs over 1 new token)
+    decode_hs = out.hidden_states[1]          # tuple of (num_layers + 1) tensors
+    # also return the decoded token id for sanity check
+    new_ids = out.sequences[0, prefill_inputs['input_ids'].shape[1]:]
+    return decode_hs, new_ids
 
 
 @torch.no_grad()
@@ -298,29 +304,37 @@ def main():
     }
     prefill_kwargs = {k: v for k, v in prefill_kwargs.items() if v is not None}
 
+    # sanity: prefill via plain forward on both models, last-pos logits should match
     if hasattr(base, 'reset_status'):
         base.reset_status()
-    out_a = base(**prefill_kwargs)
-    cache_a = out_a.past_key_values
-    first_tok_a = torch.argmax(out_a.logits[:, -1, :], dim=-1)
+    out_pre_a = base(**prefill_kwargs)
+    first_tok_a_pre = torch.argmax(out_pre_a.logits[:, -1, :], dim=-1).item()
 
     kang.reset_status()
-    out_b = kang.base_model.model(**prefill_kwargs)
-    kang.base_model.past_key_values = out_b.past_key_values
-    first_tok_b = torch.argmax(out_b.logits[:, -1, :], dim=-1)
+    out_pre_b = kang.base_model.model(**prefill_kwargs)
+    kang.base_model.past_key_values = out_pre_b.past_key_values
+    first_tok_b = torch.argmax(out_pre_b.logits[:, -1, :], dim=-1).item()
+    diff_pre = (out_pre_a.logits[:, -1, :].float() - out_pre_b.logits[:, -1, :].float()).abs().max().item()
+    print(f"  prefill last-pos logits max diff : {diff_pre:.3e}")
+    print(f"  first_tok via plain forward on base : {first_tok_a_pre} "
+          f"({processor.tokenizer.decode([first_tok_a_pre])!r})")
+    print(f"  first_tok via plain forward on kang : {first_tok_b} "
+          f"({processor.tokenizer.decode([first_tok_b])!r})")
+    del out_pre_a
 
-    print(f"  first_tok full   : {first_tok_a.item()} ({processor.tokenizer.decode([first_tok_a.item()])!r})")
-    print(f"  first_tok manual : {first_tok_b.item()} ({processor.tokenizer.decode([first_tok_b.item()])!r})")
-    print(f"  prefill last-pos logits max diff : "
-          f"{(out_a.logits[:, -1, :].float() - out_b.logits[:, -1, :].float()).abs().max().item():.3e}")
+    # path A: re-run via generate() to capture decode hidden_states the way HF does it
+    if hasattr(base, 'reset_status'):
+        base.reset_status()
+    hs_a, new_ids_a = full_forward_one_token(base, processor, prefill_kwargs)
+    first_tok_a = new_ids_a[0].item()
+    print(f"  first_tok via generate() prefill    : {first_tok_a} "
+          f"({processor.tokenizer.decode([first_tok_a])!r})")
 
     # --- one decode step on both paths ---
     print("\n--- decode step 1 ---")
-    next_tok = first_tok_a.view(1, 1).to(args.device)
+    next_tok = torch.tensor([[first_tok_a]], device=args.device)
 
-    hs_a, cache_a_after, logits_a = full_forward_one_token(base, next_tok, cache_a)
     hs_b, logits_b, dbg = manual_forward_one_token(kang, next_tok, args.exit_layer)
-    pos_ids_a_dbg = "<from HF prepare_inputs>"
 
     print(f"  full forward returned {len(hs_a)} hidden_states (embed + {len(hs_a)-1} layers)")
     print(f"  manual returned {len(hs_b)} hidden_states (embed + {len(hs_b)-2} layers + final_norm)")
@@ -347,15 +361,16 @@ def main():
         name = "embedding" if i == 0 else f"layer{i-1}"
         print(f"  {i:>4}  {name:<14}  {max_d:>14.3e}  {mean_d:>14.3e}  {flag:>6}")
 
-    # final norm comparison
-    a_final = base.model.model.norm(hs_a[-1]).float()
+    # final norm comparison: compute norm(hs_a[-1]) and compare to hs_b[-1]
+    a_final = base.model.norm(hs_a[-1]).float()
     b_final = hs_b[-1].float()
     diff_norm = (a_final - b_final).abs()
     print(f"  {'norm':>4}  {'final_norm':<14}  {diff_norm.max().item():>14.3e}  "
           f"{diff_norm.mean().item():>14.3e}")
 
-    # logits comparison
-    diff_logits = (logits_a.float() - logits_b.float()).abs()
+    # logits via lm_head on each path's final-norm output
+    logits_a = base.lm_head(a_final)
+    diff_logits = (logits_a - logits_b.float()).abs()
     top1_a = logits_a[:, -1, :].argmax(-1).item()
     top1_b = logits_b[:, -1, :].argmax(-1).item()
     print(f"\n  logits max diff: {diff_logits.max().item():.3e}")
