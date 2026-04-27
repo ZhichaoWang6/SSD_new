@@ -38,6 +38,8 @@ import torch
 from tqdm import tqdm
 from transformers import AutoProcessor
 
+from ar_generate import autoregressive_manual_baseline
+from kangaroo_model import KangarooQwenModel
 from model import Qwen2_5_VLForConditionalGeneration
 from qwen_vl_utils import process_vision_info
 
@@ -68,6 +70,12 @@ def parse_args():
     parser.add_argument("--end", type=int, default=None)
     parser.add_argument("--max_new_tokens", type=int, default=512)
     parser.add_argument("--attn_implementation", type=str, default="flash_attention_2")
+    parser.add_argument("--manual_ar", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the same manual AR baseline path as inference.py "
+                             "(autoregressive_manual_baseline) instead of model.generate(). "
+                             "Default: True. Pass --no-manual-ar to fall back to model.generate().")
+    parser.add_argument("--exit_layer", type=int, default=2,
+                        help="Early-exit split layer used by manual AR baseline.")
     return parser.parse_args()
 
 
@@ -172,10 +180,10 @@ def convert_messages_to_prompt(example, index, image_root, strip_prefix, strip_e
 
 
 @torch.no_grad()
-def generate_reply(model, processor, history, device, max_new_tokens):
+def generate_reply(model, processor, history, device, max_new_tokens,
+                   manual_ar=True, exit_layer=2):
     text = processor.apply_chat_template(history, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(history)
-    # print(text)
     inputs = processor(
         text=[text],
         images=image_inputs,
@@ -183,6 +191,19 @@ def generate_reply(model, processor, history, device, max_new_tokens):
         padding=True,
         return_tensors="pt",
     ).to(device)
+
+    if manual_ar:
+        if hasattr(model, "reset_status"):
+            model.reset_status()
+        reply_text, _, _ = autoregressive_manual_baseline(
+            model=model,
+            inputs=inputs,
+            processor=processor,
+            max_new_tokens=max_new_tokens,
+            early_exit_layer=exit_layer,
+        )
+        return reply_text.strip()
+
     output_ids = model.generate(
         **inputs,
         max_new_tokens=max_new_tokens,
@@ -226,11 +247,20 @@ def main():
     model = None
     if args.generate_replies:
         processor = AutoProcessor.from_pretrained(args.model_path)
-        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-            args.model_path,
-            torch_dtype=torch.bfloat16,
-            attn_implementation=args.attn_implementation,
-        ).eval().to(args.device)
+        if args.manual_ar:
+            model = KangarooQwenModel(
+                base_model_path=args.model_path,
+                adapter_model_path=None,
+                early_exit_layer=args.exit_layer,
+                dtype=torch.bfloat16,
+                attn_implementation=args.attn_implementation,
+            ).eval().to(args.device)
+        else:
+            model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+                args.model_path,
+                torch_dtype=torch.bfloat16,
+                attn_implementation=args.attn_implementation,
+            ).eval().to(args.device)
 
     outputs = []
     skipped = 0
@@ -258,6 +288,8 @@ def main():
                             history=conversation,
                             device=args.device,
                             max_new_tokens=args.max_new_tokens,
+                            manual_ar=args.manual_ar,
+                            exit_layer=args.exit_layer,
                         )
                         conversation.append({"role": "assistant", "content": reply})
 

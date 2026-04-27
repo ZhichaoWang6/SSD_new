@@ -46,8 +46,10 @@ def parse_args():
     parser.add_argument("--streaming_turns", action="store_true",
                         help="Generate one assistant reply after each streaming user frame turn. "
                              "A leading text-only question turn is kept as context without generating.")
-    parser.add_argument("--manual_ar", action="store_true",
-                        help="Use the same manual AR baseline path as inference.py instead of model.generate().")
+    parser.add_argument("--manual_ar", action=argparse.BooleanOptionalAction, default=True,
+                        help="Use the same manual AR baseline path as inference.py "
+                             "(autoregressive_manual_baseline) instead of model.generate(). "
+                             "Default: True. Pass --no-manual-ar to fall back to model.generate().")
     parser.add_argument("--exit_layer", type=int, default=2,
                         help="Early-exit split layer used by the manual AR baseline.")
     parser.add_argument("--fps", type=float, default=2.0)
