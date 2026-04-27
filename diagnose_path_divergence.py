@@ -162,8 +162,11 @@ def full_forward_one_token(base_model, processor, prefill_inputs):
     that HF generate() uses, including its prepare_inputs_for_generation
     handling of cache_position / position_ids / rope_deltas.
     """
+    # generate() owns these flags itself; strip them so we don't pass them twice.
+    gen_inputs = {k: v for k, v in prefill_inputs.items()
+                  if k not in {"use_cache", "output_hidden_states", "return_dict"}}
     out = base_model.generate(
-        **prefill_inputs,
+        **gen_inputs,
         max_new_tokens=2,                # 1 prefill + 1 decode step
         do_sample=False,
         use_cache=True,
