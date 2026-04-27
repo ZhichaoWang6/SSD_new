@@ -105,8 +105,14 @@ def build_inputs(processor, history, device):
     return inputs
 
 
+def _strip_eos(ids, eos_set):
+    while ids and ids[-1] in eos_set:
+        ids = ids[:-1]
+    return ids
+
+
 @torch.no_grad()
-def run_generate(model, processor, history, device, max_new_tokens):
+def run_generate(model, processor, history, device, max_new_tokens, eos_set):
     inputs = build_inputs(processor, history, device)
     t0 = time.perf_counter()
     out = model.generate(
@@ -120,13 +126,14 @@ def run_generate(model, processor, history, device, max_new_tokens):
     )
     t = time.perf_counter() - t0
     new_ids = out[0, inputs["input_ids"].shape[1]:].tolist()
-    return new_ids, inputs, t
+    return _strip_eos(new_ids, eos_set), inputs, t
 
 
 @torch.no_grad()
-def run_manual_ar(kang, processor, history, device, max_new_tokens, exit_layer):
+def run_manual_ar(kang, processor, history, device, max_new_tokens, exit_layer, eos_set):
     inputs = build_inputs(processor, history, device)
-    kang.reset_status()
+    if hasattr(kang, "reset_status"):
+        kang.reset_status()
     t0 = time.perf_counter()
     text, _, _ = autoregressive_manual_baseline(
         model=kang,
@@ -137,7 +144,7 @@ def run_manual_ar(kang, processor, history, device, max_new_tokens, exit_layer):
     )
     t = time.perf_counter() - t0
     ids = processor.tokenizer.encode(text, add_special_tokens=False)
-    return ids, t, text
+    return _strip_eos(ids, eos_set), t, text
 
 
 def first_diff(a, b):
@@ -176,9 +183,13 @@ def main():
     ).eval().to(args.device)
 
     tok = processor.tokenizer
+    eos = tok.eos_token_id
+    eos_set = set(eos) if isinstance(eos, list) else {eos}
+
     total_turns = 0
     matched_turns = 0
     diverging_turns = []
+    gen_self_diverge = 0
     gen_time_total = 0.0
     manual_time_total = 0.0
 
@@ -204,20 +215,29 @@ def main():
                     break
 
                 ids_gen, _, t_gen = run_generate(
-                    base, processor, history, args.device, args.max_new_tokens,
+                    base, processor, history, args.device, args.max_new_tokens, eos_set,
+                )
+                ids_gen2, _, _ = run_generate(
+                    base, processor, history, args.device, args.max_new_tokens, eos_set,
                 )
                 ids_manual, t_manual, text_manual = run_manual_ar(
-                    kang, processor, history, args.device, args.max_new_tokens, args.exit_layer,
+                    kang, processor, history, args.device, args.max_new_tokens,
+                    args.exit_layer, eos_set,
                 )
+                gen_self = (ids_gen == ids_gen2)
+                if not gen_self:
+                    gen_self_diverge += 1
                 gen_time_total += t_gen
                 manual_time_total += t_manual
 
                 total_turns += 1
                 diff_pos = first_diff(ids_gen, ids_manual)
+                self_tag = "" if gen_self else "  [GEN_NONDET]"
                 if diff_pos == -1:
                     matched_turns += 1
                     print(f"[sample {idx} turn {user_turn_count}] MATCH "
-                          f"len={len(ids_gen)} t_gen={t_gen:.2f}s t_manual={t_manual:.2f}s")
+                          f"len={len(ids_gen)} t_gen={t_gen:.2f}s t_manual={t_manual:.2f}s"
+                          f"{self_tag}")
                 else:
                     k = args.print_first_diff_context
                     a = ids_gen[max(0, diff_pos - k):diff_pos + k]
@@ -225,9 +245,13 @@ def main():
                     diverging_turns.append((idx, user_turn_count, diff_pos))
                     print(f"[sample {idx} turn {user_turn_count}] DIVERGE@{diff_pos}  "
                           f"gen_len={len(ids_gen)} manual_len={len(ids_manual)} "
-                          f"t_gen={t_gen:.2f}s t_manual={t_manual:.2f}s")
+                          f"t_gen={t_gen:.2f}s t_manual={t_manual:.2f}s"
+                          f"{self_tag}")
                     print(f"   gen   : {a} -> {[tok.decode([x]) for x in a]}")
                     print(f"   manual: {b} -> {[tok.decode([x]) for x in b]}")
+                    if not gen_self:
+                        c = ids_gen2[max(0, diff_pos - k):diff_pos + k]
+                        print(f"   gen#2 : {c} -> {[tok.decode([x]) for x in c]}")
 
                 # grow history with generate()'s reply (matches current data pipeline)
                 history.append({"role": "assistant", "content": tok.decode(ids_gen, skip_special_tokens=True)})
@@ -236,9 +260,11 @@ def main():
                 history.append(turn)
 
     print("\n========== SUMMARY ==========")
-    print(f"total turns compared : {total_turns}")
-    print(f"matched              : {matched_turns}")
-    print(f"diverged             : {len(diverging_turns)}")
+    print(f"attn_implementation       : {args.attn_implementation}")
+    print(f"total turns compared      : {total_turns}")
+    print(f"generate vs manual MATCH  : {matched_turns}")
+    print(f"generate vs manual DIVERGE: {len(diverging_turns)}")
+    print(f"generate vs generate#2 div: {gen_self_diverge}  (>0 means generate() itself is non-deterministic)")
     if diverging_turns:
         print(f"diverging (sample,turn,pos): {diverging_turns}")
     if total_turns:
