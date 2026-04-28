@@ -255,6 +255,7 @@ def main():
 
     completed_indices = set()
     existing_outputs = []
+    print(f"checkpoint file: {ckpt_path}")
     if os.path.exists(ckpt_path):
         with open(ckpt_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -270,7 +271,9 @@ def main():
                 if src is not None:
                     completed_indices.add(src)
                     existing_outputs.append(rec)
-        print(f"resume: found {len(completed_indices)} already-completed samples in {ckpt_path}")
+        print(f"resume: found {len(completed_indices)} already-completed samples; will skip them")
+    else:
+        print(f"resume: checkpoint does not exist yet, starting fresh")
 
     processor = None
     model = None
