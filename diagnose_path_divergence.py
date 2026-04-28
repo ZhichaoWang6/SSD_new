@@ -335,9 +335,9 @@ def main():
     # is the per-step hidden_states from generate's decode step (k+1).
 
     print(f"  {'step':>4}  {'first_div':>10}  {'worst_layer':<14}  "
-          f"{'layer_max_d':>11}  {'norm_d':>9}  {'logit_d':>9}  "
-          f"{'in':>22}  {'a_pred':>22}  {'b_pred':>22}  {'match':>6}")
-    print("-" * 158)
+          f"{'layer_max_d':>11}  {'norm_d':>9}  {'logit_d':>9}  {'head_d':>9}  "
+          f"{'in':>22}  {'a_pred':>22}  {'a_via_kang':>22}  {'b_pred':>22}  {'a==b':>5}")
+    print("-" * 195)
 
     first_step_div = -1
     n_steps = min(args.max_decode_steps, len(hs_a_per_step), len(new_ids_a) - 1)
@@ -360,10 +360,25 @@ def main():
                 worst_layer = "embedding" if i == 0 else f"layer{i-1}"
         norm_d = (hs_a[n_layers].float() - hs_b[n_layers + 1].float()).abs().max().item()
 
-        # Path A's logits for this decode step (from generate's lm_head on final_norm)
-        logits_a = kang.head_model(hs_a[n_layers]).float()
+        # Recompute logits via BOTH lm_head instances so we can isolate where
+        # the argmax flip comes from:
+        #   logits_a_via_base : what generate() actually saw (base.lm_head)
+        #   logits_a_via_kang : same hidden but via kang.head_model
+        #   logits_b          : manual's logits via kang.head_model
+        # If logits_a_via_base != logits_a_via_kang on the same input, cuBLAS
+        # is producing slightly different results across the two lm_head
+        # instances (smoking-gun for argmax flip).
+        logits_a_base = base.lm_head(hs_a[n_layers]).float()
+        logits_a_kang = kang.head_model(hs_a[n_layers]).float()
         logits_b_f = logits_b.float()
-        logit_d = (logits_a - logits_b_f).abs().max().item()
+        # Compare base-via-base vs kang-via-kang (the realistic end-to-end gap)
+        logit_d = (logits_a_base - logits_b_f).abs().max().item()
+        # Compare two lm_head instances on the same input
+        head_d = (logits_a_base - logits_a_kang).abs().max().item()
+        # What does base.lm_head's argmax give? (what generate ACTUALLY chose)
+        a_pred_via_base_lm = logits_a_base[:, -1, :].argmax(-1).item()
+        # What does kang.head_model's argmax on path A's final_norm give?
+        a_pred_via_kang_lm = logits_a_kang[:, -1, :].argmax(-1).item()
 
         a_pred = new_ids_a[step + 1]
         b_pred = logits_b[:, -1, :].argmax(-1).item()
@@ -374,10 +389,11 @@ def main():
 
         in_str = f"{in_tok}({processor.tokenizer.decode([in_tok])!r})"[:22]
         a_str = f"{a_pred}({processor.tokenizer.decode([a_pred])!r})"[:22]
+        ak_str = f"{a_pred_via_kang_lm}({processor.tokenizer.decode([a_pred_via_kang_lm])!r})"[:22]
         b_str = f"{b_pred}({processor.tokenizer.decode([b_pred])!r})"[:22]
         print(f"  {step:>4}  {first_step_div if first_step_div == step else '':>10}  "
-              f"{worst_layer:<14}  {worst_d:>11.3e}  {norm_d:>9.3e}  {logit_d:>9.3e}  "
-              f"{in_str:>22}  {a_str:>22}  {b_str:>22}  {match:>6}")
+              f"{worst_layer:<14}  {worst_d:>11.3e}  {norm_d:>9.3e}  {logit_d:>9.3e}  {head_d:>9.3e}  "
+              f"{in_str:>22}  {a_str:>22}  {ak_str:>22}  {b_str:>22}  {match:>5}")
 
         if a_pred in eos_ids(processor):
             print(f"  [hit EOS at step {step}]")
