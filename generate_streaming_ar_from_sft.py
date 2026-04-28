@@ -243,6 +243,35 @@ def main():
     end = args.end if args.end is not None else len(rows)
     rows = rows[args.start:end]
 
+    # Sidecar JSONL for crash-safe incremental writes. Each completed sample
+    # is appended (one JSON per line) and flushed immediately, so the run can
+    # resume after Ctrl-C / crash / OOM without re-doing finished samples.
+    if args.output_json.endswith(".jsonl"):
+        ckpt_path = args.output_json
+        final_json_path = None
+    else:
+        ckpt_path = args.output_json + ".jsonl"
+        final_json_path = args.output_json
+
+    completed_indices = set()
+    existing_outputs = []
+    if os.path.exists(ckpt_path):
+        with open(ckpt_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                meta = rec.get("metadata") or {}
+                src = meta.get("source_index")
+                if src is not None:
+                    completed_indices.add(src)
+                    existing_outputs.append(rec)
+        print(f"resume: found {len(completed_indices)} already-completed samples in {ckpt_path}")
+
     processor = None
     model = None
     if args.generate_replies:
@@ -262,58 +291,74 @@ def main():
                 attn_implementation=args.attn_implementation,
             ).eval().to(args.device)
 
-    outputs = []
+    os.makedirs(os.path.dirname(ckpt_path) or ".", exist_ok=True)
+    new_done = 0
     skipped = 0
-    for offset, example in enumerate(tqdm(rows, desc="Converting"), start=args.start):
-        try:
-            converted, source_assistants, used_images, total_images = convert_messages_to_prompt(
-                example,
-                offset,
-                image_root=args.image_root,
-                strip_prefix=args.strip_prefix,
-                strip_ego_time_suffix=args.strip_ego_time_suffix,
-            )
-            if args.prompt_only:
-                conversation = build_prompt_only_conversation(converted)
-            elif args.keep_source_assistant:
-                conversation = build_source_assistant_conversation(converted, source_assistants)
-            else:
-                conversation = []
-                for turn in converted:
-                    conversation.append(turn)
-                    if turn.get("role") == "user":
-                        reply = generate_reply(
-                            model=model,
-                            processor=processor,
-                            history=conversation,
-                            device=args.device,
-                            max_new_tokens=args.max_new_tokens,
-                            manual_ar=args.manual_ar,
-                            exit_layer=args.exit_layer,
-                        )
-                        conversation.append({"role": "assistant", "content": reply})
+    with open(ckpt_path, "a", encoding="utf-8") as ckpt_f:
+        for offset, example in enumerate(tqdm(rows, desc="Converting"), start=args.start):
+            if offset in completed_indices:
+                continue
+            try:
+                converted, source_assistants, used_images, total_images = convert_messages_to_prompt(
+                    example,
+                    offset,
+                    image_root=args.image_root,
+                    strip_prefix=args.strip_prefix,
+                    strip_ego_time_suffix=args.strip_ego_time_suffix,
+                )
+                if args.prompt_only:
+                    conversation = build_prompt_only_conversation(converted)
+                elif args.keep_source_assistant:
+                    conversation = build_source_assistant_conversation(converted, source_assistants)
+                else:
+                    conversation = []
+                    for turn in converted:
+                        conversation.append(turn)
+                        if turn.get("role") == "user":
+                            reply = generate_reply(
+                                model=model,
+                                processor=processor,
+                                history=conversation,
+                                device=args.device,
+                                max_new_tokens=args.max_new_tokens,
+                                manual_ar=args.manual_ar,
+                                exit_layer=args.exit_layer,
+                            )
+                            conversation.append({"role": "assistant", "content": reply})
 
-            outputs.append({
-                "question_id": get_question_id(example, offset),
-                "conversation": conversation,
-                "metadata": {
-                    **(example.get("metadata") or {}),
-                    "source_index": offset,
-                    "used_images": used_images,
-                    "total_images": total_images,
-                },
-            })
-        except Exception as exc:
-            skipped += 1
-            print(f"[skip] index={offset} question_id={get_question_id(example, offset)} error={exc}")
+                sample = {
+                    "question_id": get_question_id(example, offset),
+                    "conversation": conversation,
+                    "metadata": {
+                        **(example.get("metadata") or {}),
+                        "source_index": offset,
+                        "used_images": used_images,
+                        "total_images": total_images,
+                    },
+                }
+                ckpt_f.write(json.dumps(sample, ensure_ascii=False) + "\n")
+                ckpt_f.flush()
+                os.fsync(ckpt_f.fileno())
+                existing_outputs.append(sample)
+                completed_indices.add(offset)
+                new_done += 1
+            except Exception as exc:
+                skipped += 1
+                print(f"[skip] index={offset} question_id={get_question_id(example, offset)} error={exc}")
 
-    os.makedirs(os.path.dirname(args.output_json) or ".", exist_ok=True)
-    with open(args.output_json, "w", encoding="utf-8") as f:
-        json.dump(outputs, f, ensure_ascii=False, indent=2)
+    # Final consolidated JSON list (only if user asked for .json output, not .jsonl)
+    if final_json_path is not None:
+        existing_outputs.sort(key=lambda r: (r.get("metadata") or {}).get("source_index", 0))
+        with open(final_json_path, "w", encoding="utf-8") as f:
+            json.dump(existing_outputs, f, ensure_ascii=False, indent=2)
+        print(f"wrote consolidated JSON list to {final_json_path}")
 
-    print(f"saved {len(outputs)} samples to {args.output_json}; skipped={skipped}")
-    if outputs:
-        print(json.dumps(outputs[0], ensure_ascii=False, indent=2)[:1600])
+    print(f"checkpoint:   {ckpt_path} ({len(existing_outputs)} samples total)")
+    print(f"newly done:   {new_done}")
+    print(f"skipped:      {skipped}")
+    if existing_outputs:
+        print("first sample preview:")
+        print(json.dumps(existing_outputs[0], ensure_ascii=False, indent=2)[:1600])
 
 
 if __name__ == "__main__":
