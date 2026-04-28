@@ -334,9 +334,10 @@ def main():
     # even if manual diverges. Hidden-state comparison: hs_a_per_step[k]
     # is the per-step hidden_states from generate's decode step (k+1).
 
-    print(f"  {'step':>4}  {'first_div':>10}  {'name':<20}  "
-          f"{'max_d':>10}  {'in':>22}  {'a_pred':>22}  {'b_pred':>22}  {'match':>6}")
-    print("-" * 122)
+    print(f"  {'step':>4}  {'first_div':>10}  {'worst_layer':<14}  "
+          f"{'layer_max_d':>11}  {'norm_d':>9}  {'logit_d':>9}  "
+          f"{'in':>22}  {'a_pred':>22}  {'b_pred':>22}  {'match':>6}")
+    print("-" * 158)
 
     first_step_div = -1
     n_steps = min(args.max_decode_steps, len(hs_a_per_step), len(new_ids_a) - 1)
@@ -349,34 +350,34 @@ def main():
         assert len(hs_a) == n_layers + 1
         assert len(hs_b) == n_layers + 2
 
-        # Find first layer where this step's hidden_states diverge.
-        first_layer_name = None
-        first_max_d = 0.0
+        # Track the WORST layer at this step (regardless of threshold).
+        worst_layer = "embedding"
+        worst_d = 0.0
         for i in range(n_layers):
             d = (hs_a[i].float() - hs_b[i].float()).abs().max().item()
-            if d > args.threshold:
-                first_layer_name = "embedding" if i == 0 else f"layer{i-1}"
-                first_max_d = d
-                break
-        if first_layer_name is None:
-            d = (hs_a[n_layers].float() - hs_b[n_layers + 1].float()).abs().max().item()
-            if d > args.threshold:
-                first_layer_name = "final_norm"
-                first_max_d = d
+            if d > worst_d:
+                worst_d = d
+                worst_layer = "embedding" if i == 0 else f"layer{i-1}"
+        norm_d = (hs_a[n_layers].float() - hs_b[n_layers + 1].float()).abs().max().item()
 
-        a_pred = new_ids_a[step + 1]                 # generate's prediction at this step
+        # Path A's logits for this decode step (from generate's lm_head on final_norm)
+        logits_a = kang.head_model(hs_a[n_layers]).float()
+        logits_b_f = logits_b.float()
+        logit_d = (logits_a - logits_b_f).abs().max().item()
+
+        a_pred = new_ids_a[step + 1]
         b_pred = logits_b[:, -1, :].argmax(-1).item()
         match = "OK" if a_pred == b_pred else "**"
 
-        if first_step_div < 0 and (first_layer_name is not None or a_pred != b_pred):
+        if first_step_div < 0 and a_pred != b_pred:
             first_step_div = step
 
         in_str = f"{in_tok}({processor.tokenizer.decode([in_tok])!r})"[:22]
         a_str = f"{a_pred}({processor.tokenizer.decode([a_pred])!r})"[:22]
         b_str = f"{b_pred}({processor.tokenizer.decode([b_pred])!r})"[:22]
-        layer_str = first_layer_name or "(all bit-exact)"
         print(f"  {step:>4}  {first_step_div if first_step_div == step else '':>10}  "
-              f"{layer_str:<20}  {first_max_d:>10.3e}  {in_str:>22}  {a_str:>22}  {b_str:>22}  {match:>6}")
+              f"{worst_layer:<14}  {worst_d:>11.3e}  {norm_d:>9.3e}  {logit_d:>9.3e}  "
+              f"{in_str:>22}  {a_str:>22}  {b_str:>22}  {match:>6}")
 
         if a_pred in eos_ids(processor):
             print(f"  [hit EOS at step {step}]")
