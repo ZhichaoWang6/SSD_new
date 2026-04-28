@@ -264,17 +264,49 @@ def main():
 
     # ---------- Compare ----------
     print("\n--- comparison ---")
-    n = min(len(spec_new_ids), len(ar_new_ids))
+
+    # Strip trailing EOS from both sides so we don't false-alarm on the
+    # spec/AR EOS-handling difference (manual_ar decodes with
+    # skip_special_tokens=True, which drops <|im_end|>; spec returns raw ids
+    # which keeps it).
+    eos_ids_set = set(tok.eos_token_id) if isinstance(tok.eos_token_id, list) else {tok.eos_token_id}
+    spec_for_cmp = list(spec_new_ids)
+    while spec_for_cmp and spec_for_cmp[-1] in eos_ids_set:
+        spec_for_cmp.pop()
+    ar_for_cmp = list(ar_new_ids)
+    while ar_for_cmp and ar_for_cmp[-1] in eos_ids_set:
+        ar_for_cmp.pop()
+
+    # Independent text-level check: if decoded text matches, spec is lossless
+    # in the user-visible sense even if raw ids differ on edge cases.
+    spec_text_norm = tok.decode(spec_for_cmp, skip_special_tokens=True).strip()
+    ar_text_norm = ar_text.strip()
+    text_match = (spec_text_norm == ar_text_norm)
+    print(f"  text-level match : {text_match}")
+    if not text_match:
+        print(f"    spec text norm: {spec_text_norm!r}")
+        print(f"    ar   text     : {ar_text_norm!r}")
+
+    n = min(len(spec_for_cmp), len(ar_for_cmp))
     diverge_idx = -1
     for i in range(n):
-        if spec_new_ids[i] != ar_new_ids[i]:
+        if spec_for_cmp[i] != ar_for_cmp[i]:
             diverge_idx = i
             break
-    if diverge_idx < 0 and len(spec_new_ids) != len(ar_new_ids):
+    if diverge_idx < 0 and len(spec_for_cmp) != len(ar_for_cmp):
         diverge_idx = n
 
     if diverge_idx < 0:
-        print(f"  EXACT MATCH ({len(spec_new_ids)} tokens). Spec decoding is lossless on this sample.")
+        print(f"  TOKEN-LEVEL EXACT MATCH ({len(spec_for_cmp)} tokens, EOS-stripped).")
+        print(f"  Spec decoding is lossless on this sample.")
+        print(f"\n  --- accept-length analysis ---")
+        if accept_lengths:
+            print(f"  per-round accept counts: {accept_lengths}")
+            print(f"  avg accept length      : {sum(accept_lengths)/len(accept_lengths):.2f}")
+            print(f"  rounds with 1 accept   : {sum(1 for a in accept_lengths if a == 1)}/{len(accept_lengths)}")
+            print(f"  rounds with full accept: {sum(1 for a in accept_lengths if a == args.speculative_steps + 1)}/{len(accept_lengths)}")
+            print(f"  best round             : {max(accept_lengths)}")
+            print(f"  speedup ceiling (this sample): ~{sum(accept_lengths)/len(accept_lengths):.2f}x")
         return
 
     where, round_no, offset, hint = classify_divergence(
