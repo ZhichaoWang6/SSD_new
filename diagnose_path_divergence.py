@@ -327,22 +327,23 @@ def main():
 
     n_layers = len(kang.base_model.model.model.layers)
 
-    # The same first decode step uses the same input_token: argmax of prefill logits.
-    # Both generate() and our manual loop start from this token, so we feed the
-    # token chosen by generate() at each step into the manual decoder. If a step
-    # produces a different token on path B than on path A, the manual loop has
-    # *already* diverged at that step; we still keep stepping with path A's token
-    # to keep both paths synchronized for hidden-state comparison.
+    # At iteration k, both paths feed new_ids_a[k] and produce a prediction
+    # for new_ids_a[k+1]. Generate already chose new_ids_a[k+1]; the manual
+    # path's prediction is b_tok. We compare those, and we advance the loop
+    # using new_ids_a[k+1] (path A's choice) so both KV caches stay aligned
+    # even if manual diverges. Hidden-state comparison: hs_a_per_step[k]
+    # is the per-step hidden_states from generate's decode step (k+1).
 
     print(f"  {'step':>4}  {'first_div':>10}  {'name':<20}  "
-          f"{'max_d':>10}  {'a_tok':>22}  {'b_tok':>22}  {'match':>6}")
-    print("-" * 100)
+          f"{'max_d':>10}  {'in':>22}  {'a_pred':>22}  {'b_pred':>22}  {'match':>6}")
+    print("-" * 122)
 
-    next_tok_id = first_tok_b   # equal to first_tok_a (we asserted via prefill above)
     first_step_div = -1
+    n_steps = min(args.max_decode_steps, len(hs_a_per_step), len(new_ids_a) - 1)
 
-    for step in range(min(args.max_decode_steps, len(hs_a_per_step))):
-        next_tok = torch.tensor([[next_tok_id]], device=args.device)
+    for step in range(n_steps):
+        in_tok = new_ids_a[step]                    # what to feed at this step
+        next_tok = torch.tensor([[in_tok]], device=args.device)
         hs_b, logits_b = manual_decode_one_step(kang, next_tok, args.exit_layer)
         hs_a = hs_a_per_step[step]
         assert len(hs_a) == n_layers + 1
@@ -351,36 +352,33 @@ def main():
         # Find first layer where this step's hidden_states diverge.
         first_layer_name = None
         first_max_d = 0.0
-        # idx 0..n_layers-1: hs_a[i] vs hs_b[i] (embed / output of layer i-1)
         for i in range(n_layers):
             d = (hs_a[i].float() - hs_b[i].float()).abs().max().item()
             if d > args.threshold:
                 first_layer_name = "embedding" if i == 0 else f"layer{i-1}"
                 first_max_d = d
                 break
-        # final norm: hs_a[n_layers] vs hs_b[n_layers + 1]
         if first_layer_name is None:
             d = (hs_a[n_layers].float() - hs_b[n_layers + 1].float()).abs().max().item()
             if d > args.threshold:
                 first_layer_name = "final_norm"
                 first_max_d = d
 
-        a_tok = new_ids_a[step]
-        b_tok = logits_b[:, -1, :].argmax(-1).item()
-        match = "OK" if a_tok == b_tok else "**"
+        a_pred = new_ids_a[step + 1]                 # generate's prediction at this step
+        b_pred = logits_b[:, -1, :].argmax(-1).item()
+        match = "OK" if a_pred == b_pred else "**"
 
-        if first_step_div < 0 and (first_layer_name is not None or a_tok != b_tok):
+        if first_step_div < 0 and (first_layer_name is not None or a_pred != b_pred):
             first_step_div = step
 
-        a_str = f"{a_tok}({processor.tokenizer.decode([a_tok])!r})"[:22]
-        b_str = f"{b_tok}({processor.tokenizer.decode([b_tok])!r})"[:22]
+        in_str = f"{in_tok}({processor.tokenizer.decode([in_tok])!r})"[:22]
+        a_str = f"{a_pred}({processor.tokenizer.decode([a_pred])!r})"[:22]
+        b_str = f"{b_pred}({processor.tokenizer.decode([b_pred])!r})"[:22]
         layer_str = first_layer_name or "(all bit-exact)"
         print(f"  {step:>4}  {first_step_div if first_step_div == step else '':>10}  "
-              f"{layer_str:<20}  {first_max_d:>10.3e}  {a_str:>22}  {b_str:>22}  {match:>6}")
+              f"{layer_str:<20}  {first_max_d:>10.3e}  {in_str:>22}  {a_str:>22}  {b_str:>22}  {match:>6}")
 
-        # use path A's token to keep stepping (so both caches stay synchronized)
-        next_tok_id = a_tok
-        if a_tok in eos_ids(processor):
+        if a_pred in eos_ids(processor):
             print(f"  [hit EOS at step {step}]")
             break
 
